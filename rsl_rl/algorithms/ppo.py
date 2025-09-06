@@ -10,7 +10,9 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import (
+    ActorCritic, ActorCriticRecurrent, MLP_Encoder, StudentTeacher, StudentTeacherRecurrent,
+)
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,26 +21,30 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
+    encoder: MLP_Encoder
     policy: ActorCritic
     """The actor critic module."""
 
     def __init__(
         self,
-        policy,
-        num_learning_epochs=1,
-        num_mini_batches=1,
-        clip_param=0.2,
-        gamma=0.998,
-        lam=0.95,
-        value_loss_coef=1.0,
-        entropy_coef=0.0,
-        learning_rate=1e-3,
-        max_grad_norm=1.0,
-        use_clipped_value_loss=True,
-        schedule="fixed",
-        desired_kl=0.01,
-        device="cpu",
-        normalize_advantage_per_mini_batch=False,
+        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent,
+        encoder: MLP_Encoder,
+        num_learning_epochs: int = 1,
+        num_mini_batches: int = 1,
+        clip_param: float = 0.2,
+        gamma: float = 0.998,
+        lam: float = 0.95,
+        value_loss_coef: float = 1.0,
+        entropy_coef: float = 0.0,
+        learning_rate: float = 1e-3,
+        est_learning_rate: float = 1e-3,
+        max_grad_norm: float = 1.0,
+        use_clipped_value_loss: bool = True,
+        schedule: str = "fixed",
+        desired_kl: float = 0.01,
+        critic_take_latent: bool = False,
+        device: str = "cpu",
+        normalize_advantage_per_mini_batch: bool = False,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -91,11 +97,22 @@ class PPO:
         else:
             self.symmetry = None
 
+        self.encoder = encoder
+        self.encoder.to(self.device)
+
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        if self.encoder.num_output_dim != 0:
+            self.extra_optimizer = optim.Adam(
+                self.encoder.parameters(), lr=est_learning_rate
+            )
+        else:
+            self.extra_optimizer = None
+        
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -114,9 +131,17 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.critic_take_latent = critic_take_latent
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
+        self,
+        training_type: str,
+        num_envs: int,
+        num_transitions_per_env: int,
+        actor_obs_shape: list[int],
+        critic_obs_shape: list[int],
+        obs_history_shape: list[int],
+        actions_shape: list[int],
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -130,22 +155,32 @@ class PPO:
             num_transitions_per_env,
             actor_obs_shape,
             critic_obs_shape,
+            obs_history_shape,
             actions_shape,
             rnd_state_shape,
             self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, obs: torch.Tensor, obs_history: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
+        
+        # encode the history
+        encoder_out = self.encoder.encode(obs_history)
+        if self.critic_take_latent:
+            critic_obs = torch.cat((critic_obs, encoder_out), dim=-1)
+
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.actions = self.policy.act(
+            torch.cat((encoder_out, obs), dim=-1)
+        ).detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
+        self.transition.observation_history = obs_history
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
 
@@ -210,6 +245,7 @@ class PPO:
         for (
             obs_batch,
             critic_obs_batch,
+            obs_history_batch,
             actions_batch,
             target_values_batch,
             advantages_batch,
@@ -256,8 +292,14 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
+            # -- encoder
+            encoder_out_batch = self.encoder.encode(obs_history_batch)
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(
+                torch.cat((encoder_out_batch, obs_batch), dim=-1),
+                masks=masks_batch,
+                hidden_states=hid_states_batch[0],
+            )
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -401,6 +443,36 @@ class PPO:
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
+
+        num_updates_extra = 0
+        mean_extra_loss = 0
+        if self.extra_optimizer is not None:
+            generator = self.storage.encoder_mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs
+            )
+            for (
+                critic_obs_batch,
+                obs_history_batch,
+            ) in generator:
+                if self.encoder.is_mlp_encoder:
+                    self.encoder.encode(obs_history_batch)
+                    encode_batch = self.encoder.get_encoder_out()
+
+                if self.encoder.is_mlp_encoder:
+                    extra_loss = (
+                        (encode_batch[:, 0:3] - critic_obs_batch[:, 0:3]).pow(2).mean()
+                    )
+                else:
+                    extra_loss = torch.zeros_like(value_loss)
+
+                self.extra_optimizer.zero_grad()
+                extra_loss.backward()
+                self.extra_optimizer.step()
+
+                num_updates_extra += 1
+                mean_extra_loss += extra_loss.item()
+
+
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -412,12 +484,18 @@ class PPO:
         # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+
+        # -- For Extra
+        if num_updates_extra > 0:
+            mean_extra_loss /= num_updates_extra
+
         # -- Clear the storage
         self.storage.clear()
 
         # construct the loss dictionary
         loss_dict = {
             "value_function": mean_value_loss,
+            "extra_loss": mean_extra_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }

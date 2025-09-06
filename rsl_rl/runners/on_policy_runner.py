@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
+    MLP_Encoder,
 )
 from rsl_rl.utils import store_code_state
 
@@ -30,6 +31,7 @@ class OnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
+        self.encoder_cfg = train_cfg[train_cfg["encoder_class_name"]]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
@@ -46,8 +48,9 @@ class OnPolicyRunner:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
         # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
+        obs, obs_history, extras = self.env.get_observations()
         num_obs = obs.shape[1]
+        obs_history_buf_length = obs_history.shape[1]
 
         # resolve type of privileged observations
         if self.training_type == "rl":
@@ -61,16 +64,22 @@ class OnPolicyRunner:
             else:
                 self.privileged_obs_type = None
 
+        # evaluate the encoder class
+        encoder_class = eval(self.cfg["encoder_class_name"])
+        encoder: MLP_Encoder = encoder_class(**self.encoder_cfg).to(self.device)
+
         # resolve dimensions of privileged observations
         if self.privileged_obs_type is not None:
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
+        if self.alg_cfg["critic_take_latent"]:
+            num_privileged_obs += encoder.num_output_dim
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            num_obs + encoder.num_output_dim, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # resolve dimension of rnd gated state
@@ -94,7 +103,7 @@ class OnPolicyRunner:
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
         self.alg: PPO | Distillation = alg_class(
-            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            policy, encoder, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
         # store training configuration
@@ -117,6 +126,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             [num_obs],
             [num_privileged_obs],
+            [obs_history_buf_length],
             [self.env.num_actions],
         )
 
@@ -130,6 +140,8 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+        # TODO: maybe add an env reset here
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -166,9 +178,9 @@ class OnPolicyRunner:
             )
 
         # start learning
-        obs, extras = self.env.get_observations()
+        obs, obs_history, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        obs, obs_history, privileged_obs = obs.to(self.device), obs_history.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -201,11 +213,12 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    actions = self.alg.act(obs, obs_history, privileged_obs)
                     # Step the environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, obs_history, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    obs, obs_history, rewards, dones = (
+                        obs.to(self.device), obs_history.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -256,7 +269,13 @@ class OnPolicyRunner:
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs)
+                    if self.alg.critic_take_latent:
+                        encoder_out = self.alg.encoder.encode(obs_history)
+                        self.alg.compute_returns(
+                            torch.cat((privileged_obs, encoder_out), dim=-1)
+                        )
+                    else:
+                        self.alg.compute_returns(privileged_obs)
 
             # update policy
             loss_dict = self.alg.update()
@@ -403,6 +422,7 @@ class OnPolicyRunner:
         # -- Save model
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
+            "encoder_state_dict": self.alg.encoder.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
@@ -427,6 +447,7 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        self.alg.encoder.load_state_dict(loaded_dict["encoder_state_dict"])
         # -- Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -464,10 +485,18 @@ class OnPolicyRunner:
                 self.obs_normalizer.to(device)
             policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
         return policy
+    
+    def get_inference_encoder(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.encoder.to(device)
+        return self.alg.encoder.encode
 
     def train_mode(self):
         # -- PPO
         self.alg.policy.train()
+        # -- Encoder
+        self.alg.encoder.train()
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.train()
@@ -479,6 +508,8 @@ class OnPolicyRunner:
     def eval_mode(self):
         # -- PPO
         self.alg.policy.eval()
+        # -- Encoder
+        self.alg.encoder.eval()
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.eval()

@@ -14,6 +14,7 @@ class RolloutStorage:
     class Transition:
         def __init__(self):
             self.observations = None
+            self.observation_history = None
             self.privileged_observations = None
             self.actions = None
             self.privileged_actions = None
@@ -36,6 +37,7 @@ class RolloutStorage:
         num_transitions_per_env,
         obs_shape,
         privileged_obs_shape,
+        obs_history_shape,
         actions_shape,
         rnd_state_shape=None,
         device="cpu",
@@ -52,6 +54,9 @@ class RolloutStorage:
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        self.observation_history = torch.zeros(
+            num_transitions_per_env, num_envs, *obs_history_shape, device=self.device
+        )
         if privileged_obs_shape is not None:
             self.privileged_observations = torch.zeros(
                 num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
@@ -93,6 +98,7 @@ class RolloutStorage:
 
         # Core
         self.observations[self.step].copy_(transition.observations)
+        self.observation_history[self.step].copy_(transition.observation_history)
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.privileged_observations)
         self.actions[self.step].copy_(transition.actions)
@@ -176,7 +182,7 @@ class RolloutStorage:
                 privileged_observations = self.privileged_observations[i]
             else:
                 privileged_observations = self.observations[i]
-            yield self.observations[i], privileged_observations, self.actions[i], self.privileged_actions[
+            yield self.observations[i], self.observation_history[i], privileged_observations, self.actions[i], self.privileged_actions[
                 i
             ], self.dones[i]
 
@@ -190,6 +196,7 @@ class RolloutStorage:
 
         # Core
         observations = self.observations.flatten(0, 1)
+        observation_history = self.observation_history.flatten(0, 1)
         if self.privileged_observations is not None:
             privileged_observations = self.privileged_observations.flatten(0, 1)
         else:
@@ -219,6 +226,7 @@ class RolloutStorage:
                 # Create the mini-batch
                 # -- Core
                 obs_batch = observations[batch_idx]
+                obs_history_batch = observation_history[batch_idx]
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
 
@@ -237,7 +245,7 @@ class RolloutStorage:
                     rnd_state_batch = None
 
                 # yield the mini-batch
-                yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, privileged_observations_batch, obs_history_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
                 ), None, rnd_state_batch
@@ -247,6 +255,7 @@ class RolloutStorage:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        padded_obs_history_trajectories, _ = split_and_pad_trajectories(self.observation_history, self.dones)
         if self.privileged_observations is not None:
             padded_privileged_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
         else:
@@ -273,6 +282,7 @@ class RolloutStorage:
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                obs_history_batch = padded_obs_history_trajectories[:, first_traj:last_traj]
                 privileged_obs_batch = padded_privileged_obs_trajectories[:, first_traj:last_traj]
 
                 if padded_rnd_state_trajectories is not None:
@@ -308,9 +318,33 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, privileged_obs_batch, obs_history_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
                 ), masks_batch, rnd_state_batch
 
                 first_traj = last_traj
+
+    def encoder_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(
+            num_mini_batches * mini_batch_size, requires_grad=False, device=self.device
+        )
+
+        observations = self.observations.flatten(0, 1)
+        obs_history = self.observation_history.flatten(0, 1)
+        if self.privileged_observations is not None:
+            privileged_observations = self.privileged_observations.flatten(0, 1)
+        else:
+            privileged_observations = observations
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                batch_idx = indices[start:end]
+
+                privileged_obs_batch = privileged_observations[batch_idx]
+                obs_history_batch = obs_history[batch_idx]
+                yield privileged_obs_batch, obs_history_batch

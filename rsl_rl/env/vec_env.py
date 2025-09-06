@@ -68,7 +68,7 @@ class VecEnv(ABC):
     """
 
     @abstractmethod
-    def get_observations(self) -> tuple[torch.Tensor, dict]:
+    def get_observations(self) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Return the current observations.
 
         Returns:
@@ -86,7 +86,7 @@ class VecEnv(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Apply input action on the environment.
 
         The extra information is a dictionary. It includes metrics such as the episode reward, episode length,
